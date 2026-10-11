@@ -298,6 +298,134 @@ class TestNoBodyWithStatus:
         assert res.content == b''
 
 
+class _UnserializableMediaResource:
+    def on_get(self, req, resp):
+        resp.media = object()
+
+
+class _UnserializableMediaResourceAsync:
+    async def on_get(self, req, resp):
+        resp.media = object()
+
+
+class _RaiseNotFoundResource:
+    def on_get(self, req, resp):
+        raise falcon.HTTPNotFound()
+
+
+class _RaiseNotFoundResourceAsync:
+    async def on_get(self, req, resp):
+        raise falcon.HTTPNotFound()
+
+
+class _OkResource:
+    def on_get(self, req, resp):
+        resp.text = 'ok'
+
+
+class _OkResourceAsync:
+    async def on_get(self, req, resp):
+        resp.text = 'ok'
+
+
+class _RaiseInResponseMiddleware:
+    def process_response(self, req, resp, resource, req_succeeded):
+        raise RuntimeError('response middleware failed')
+
+    async def process_response_async(self, req, resp, resource, req_succeeded):
+        self.process_response(req, resp, resource, req_succeeded)
+
+
+class TestErrorResponseLifecycle:
+    def _make_client(self, asgi, util, resource, **kwargs):
+        app = util.create_app(asgi, **kwargs)
+        app.add_route('/', resource)
+        return testing.TestClient(app)
+
+    def test_body_rerendered_after_render_failure(self, asgi, util):
+        # NOTE: The response has not started yet when the body is rendered, so
+        #   a rendering failure must result in the complete error response
+        #   instead of an empty 500 with no body.
+        resource = (
+            _UnserializableMediaResourceAsync()
+            if asgi
+            else _UnserializableMediaResource()
+        )
+        client = self._make_client(asgi, util, resource)
+
+        result = client.simulate_get('/')
+        assert result.status_code == 500
+        assert result.headers['content-type'] == constants.MEDIA_JSON
+        assert result.json['title'] == '500 Internal Server Error'
+
+    def test_error_handler_called_once_after_render_failure(self, asgi, util):
+        calls = []
+
+        def handle_type_error(req, resp, ex, params):
+            calls.append(type(ex))
+            resp.status = falcon.HTTP_500
+            resp.text = 'render error handled'
+
+        resource = (
+            _UnserializableMediaResourceAsync()
+            if asgi
+            else _UnserializableMediaResource()
+        )
+        client = self._make_client(asgi, util, resource)
+        client.app.add_error_handler(TypeError, handle_type_error)
+
+        result = client.simulate_get('/')
+        assert result.status_code == 500
+        assert result.text == 'render error handled'
+        assert calls == [TypeError]
+
+    def test_faulty_error_serializer_is_separated(self, asgi, util):
+        # NOTE: A failure while serializing the error response is propagated
+        #   as-is (instead of feeding it back to the error handler), so that
+        #   it is not confused with the original exception.
+        def faulty_serializer(req, resp, ex):
+            resp.content_type = falcon.MEDIA_TEXT
+            resp.text = f'{0 / 0}'
+
+        resource = _RaiseNotFoundResourceAsync() if asgi else _RaiseNotFoundResource()
+        client = self._make_client(asgi, util, resource)
+        client.app.set_error_serializer(faulty_serializer)
+
+        with pytest.raises(ZeroDivisionError):
+            client.simulate_get('/')
+
+    def test_body_render_failure_unhandled_propagates(self, asgi, util):
+        # NOTE: No response has been started yet, and there is no handler to
+        #   compose an alternative one, so the rendering error surfaces as-is.
+        resource = (
+            _UnserializableMediaResourceAsync()
+            if asgi
+            else _UnserializableMediaResource()
+        )
+        client = self._make_client(asgi, util, resource)
+        client.app._error_handlers.clear()
+
+        with pytest.raises(TypeError):
+            client.simulate_get('/')
+
+    def test_body_render_failure_after_committed_error_propagates(self, asgi, util):
+        # NOTE: Once an error response has been committed, a failure while
+        #   rendering it is propagated instead of invoking the error handler a
+        #   second time (and without emitting a partial response).
+        def handle_runtime_error(req, resp, ex, params):
+            resp.status = falcon.HTTP_400
+            resp.media = object()
+
+        resource = _OkResourceAsync() if asgi else _OkResource()
+        app = util.create_app(asgi, middleware=[_RaiseInResponseMiddleware()])
+        app.add_error_handler(RuntimeError, handle_runtime_error)
+        app.add_route('/', resource)
+        client = testing.TestClient(app)
+
+        with pytest.raises(TypeError):
+            client.simulate_get('/')
+
+
 class CustomErrorResource:
     def on_get(self, req, res):
         res.data = b'foo'

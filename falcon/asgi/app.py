@@ -46,6 +46,7 @@ from falcon._typing import AsgiSend
 from falcon._typing import AsgiSinkCallable
 from falcon._typing import AsyncMiddleware
 from falcon._typing import Resource
+from falcon._typing import ResponseStatus
 from falcon._typing import SinkPrefix
 import falcon.app
 from falcon.app_helpers import AsyncPreparedMiddlewareResult
@@ -526,6 +527,11 @@ class App(falcon.app.App[_ReqT, _RespT]):
 
         req_succeeded = False
 
+        # NOTE: The status committed by the first handled error. Response
+        #   middleware may still add headers on the error path, but it must not
+        #   be able to override this status (see also: independent_middleware).
+        error_status: ResponseStatus | None = None
+
         try:
             if req.method in self._META_METHODS:
                 raise HTTPBadRequest()
@@ -565,6 +571,8 @@ class App(falcon.app.App[_ReqT, _RespT]):
             if not await self._handle_exception(req, resp, ex, params):
                 raise
 
+            error_status = resp.status
+
         else:
             try:
                 # NOTE(kgriffs): If the request did not match any
@@ -590,67 +598,112 @@ class App(falcon.app.App[_ReqT, _RespT]):
                 if not await self._handle_exception(req, resp, ex, params):
                     raise
 
+                error_status = resp.status
+
         # Call process_response middleware methods.
         for process_response in mw_resp_stack or dependent_mw_resp_stack:
             try:
                 await process_response(req, resp, resource, req_succeeded)
 
             except Exception as ex:
-                if not await self._handle_exception(req, resp, ex, params):
-                    raise
-
                 req_succeeded = False
+
+                if error_status is None:
+                    # NOTE: The error handler is committed for the first
+                    #   exception only. Exceptions raised by subsequent
+                    #   response middleware steps must not overwrite the
+                    #   already-committed error response; these are logged
+                    #   while the remaining eligible steps still run.
+                    if not await self._handle_exception(req, resp, ex, params):
+                        raise
+
+                    error_status = resp.status
+                else:
+                    falcon._logger.error(
+                        '[FALCON] Error raised by response middleware after '
+                        'the error response was already committed.',
+                        exc_info=ex,
+                    )
+            finally:
+                if error_status is not None and resp.status != error_status:
+                    # NOTE: Response middleware may add headers on the error
+                    #   path, but the status chosen by the error handler is
+                    #   committed exactly once and may not be overridden.
+                    resp.status = error_status
 
         data: bytes | None = b''
 
-        try:
-            # NOTE(vytas): It is only safe to inline Response.render_body()
-            #   where we can be sure it hasn't been overridden, either directly
-            #   or by modifying the behavior of its dependencies.
-            if self._standard_response_type:
-                # PERF(vytas): inline Response.render_body() in this critical code
-                #   path in order to shave off an await.
-                text = resp.text
-                if text is None:
-                    data = resp._data
+        # NOTE: The http.response.start message has not been sent yet, so the
+        #   response must not be partially emitted. If rendering the body
+        #   raises, the (first) error handler gets one chance to compose an
+        #   alternative response, which is then rendered instead of the failed
+        #   one. If that rendering also fails, the exception is propagated
+        #   rather than being fed back to error handling (which would conflate
+        #   it with the original exception).
+        while True:
+            try:
+                # NOTE(vytas): It is only safe to inline Response.render_body()
+                #   where we can be sure it hasn't been overridden, either
+                #   directly or by modifying the behavior of its dependencies.
+                if self._standard_response_type:
+                    # PERF(vytas): inline Response.render_body() in this
+                    # critical code path in order to shave off an await.
+                    text = resp.text
+                    if text is None:
+                        data = resp._data
 
-                    if data is None and resp._media is not None:
-                        # NOTE(kgriffs): We use a special _UNSET singleton since
-                        #   None is ambiguous (the media handler might return None).
-                        if resp._media_rendered is _UNSET:
-                            opt = resp.options
-                            if not resp.content_type:
-                                resp.content_type = opt.default_media_type
+                        if data is None and resp._media is not None:
+                            # NOTE(kgriffs): We use a special _UNSET singleton
+                            #   since None is ambiguous (the media handler might
+                            #   return None).
+                            if resp._media_rendered is _UNSET:
+                                opt = resp.options
+                                if not resp.content_type:
+                                    resp.content_type = opt.default_media_type
 
-                            handler, serialize_sync, _ = opt.media_handlers._resolve(
-                                resp.content_type, opt.default_media_type
-                            )
-
-                            if serialize_sync:
-                                resp._media_rendered = serialize_sync(resp._media)
-                            else:
-                                resp._media_rendered = await handler.serialize_async(
-                                    resp._media, resp.content_type
+                                handler, serialize_sync, _ = (
+                                    opt.media_handlers._resolve(
+                                        resp.content_type, opt.default_media_type
+                                    )
                                 )
 
-                        data = resp._media_rendered
+                                if serialize_sync:
+                                    resp._media_rendered = serialize_sync(resp._media)
+                                else:
+                                    resp._media_rendered = (
+                                        await handler.serialize_async(
+                                            resp._media, resp.content_type
+                                        )
+                                    )
+
+                            data = resp._media_rendered
+                    else:
+                        try:
+                            # NOTE(kgriffs): Normally we expect text to be a
+                            #   string
+                            data = text.encode()
+                        except AttributeError:
+                            # NOTE(kgriffs): Assume it was a bytes object
+                            #   already
+                            data = text  # type: ignore[assignment]
+
                 else:
-                    try:
-                        # NOTE(kgriffs): Normally we expect text to be a string
-                        data = text.encode()
-                    except AttributeError:
-                        # NOTE(kgriffs): Assume it was a bytes object already
-                        data = text  # type: ignore[assignment]
+                    # NOTE(vytas): Custom response type.
+                    data = await resp.render_body()
 
-            else:
-                # NOTE(vytas): Custom response type.
-                data = await resp.render_body()
+            except Exception as ex:
+                if error_status is not None:
+                    raise
 
-        except Exception as ex:
-            if not await self._handle_exception(req, resp, ex, params):
-                raise
+                if not await self._handle_exception(req, resp, ex, params):
+                    raise
 
-            req_succeeded = False
+                error_status = resp.status
+                req_succeeded = False
+                data = b''
+                continue
+
+            break
 
         resp_status: int = resp.status_code
         default_media_type: str | None = self.resp_options.default_media_type
@@ -1400,37 +1453,47 @@ class App(falcon.app.App[_ReqT, _RespT]):
         Returns:
             bool: ``True`` if a handler was found and called for the
             exception, ``False`` otherwise.
+
+        Note:
+            Any exception raised by the matched error handler itself (other
+            than an :class:`~.HTTPError` or :class:`~.HTTPStatus` used to
+            describe the response), including an error serializer failure, is
+            allowed to propagate from this method instead of being passed back
+            to error handling. This keeps such a secondary exception distinct
+            from the original one, and ensures that the error handler is only
+            invoked once for the same failure.
         """
         err_handler = self._find_error_handler(ex)
 
         if resp:
-            # NOTE(caselit): Reset body, data and media before calling the handler
+            # NOTE(caselit): Reset body, data and media before calling the
+            #   handler.
             resp.text = resp.data = resp.media = None
 
-        if err_handler is not None:
-            try:
-                kwargs = {}
+        if err_handler is None:
+            # NOTE(kgriffs): No error handlers are defined for ex
+            # and it is not one of (HTTPStatus, HTTPError), since it
+            # would have matched one of the corresponding default
+            # handlers.
+            return False
 
-                # PERF(vytas): Using the LRU-cache backed misc._has_arg_name
-                #   here as inspect.signature (and by proxy misc.get_argnames)
-                #   can be very slow (on the order of magnitude of 10 µs).
-                if ws is not None and _has_arg_name(err_handler, 'ws'):
-                    kwargs['ws'] = ws
+        try:
+            kwargs = {}
 
-                await err_handler(req, resp, ex, params, **kwargs)
+            # PERF(vytas): Using the LRU-cache backed misc._has_arg_name
+            #   here as inspect.signature (and by proxy misc.get_argnames)
+            #   can be very slow (on the order of magnitude of 10 µs).
+            if ws is not None and _has_arg_name(err_handler, 'ws'):
+                kwargs['ws'] = ws
 
-            except HTTPStatus as status:
-                await self._http_status_handler(req, resp, status, params, ws=ws)
-            except HTTPError as error:
-                await self._http_error_handler(req, resp, error, params, ws=ws)
+            await err_handler(req, resp, ex, params, **kwargs)
 
-            return True
+        except HTTPStatus as status:
+            await self._http_status_handler(req, resp, status, params, ws=ws)
+        except HTTPError as error:
+            await self._http_error_handler(req, resp, error, params, ws=ws)
 
-        # NOTE(kgriffs): No error handlers are defined for ex
-        # and it is not one of (HTTPStatus, HTTPError), since it
-        # would have matched one of the corresponding default
-        # handlers.
-        return False
+        return True
 
     async def _ws_cleanup_on_error(self, ws: WebSocket) -> None:
         # NOTE(kgriffs): Attempt to close cleanly on our end

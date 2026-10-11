@@ -48,6 +48,7 @@ from falcon._typing import ErrorSerializer
 from falcon._typing import FindMethod
 from falcon._typing import ProcessResponseMethod
 from falcon._typing import ResponderCallable
+from falcon._typing import ResponseStatus
 from falcon._typing import SinkCallable
 from falcon._typing import SinkPrefix
 from falcon._typing import StartResponse
@@ -427,6 +428,11 @@ class App(Generic[_ReqT, _RespT]):
 
         req_succeeded = False
 
+        # NOTE: The status committed by the first handled error. Response
+        #   middleware may still add headers on the error path, but it must not
+        #   be able to override this status (see also: independent_middleware).
+        error_status: ResponseStatus | None = None
+
         try:
             if req.method in self._META_METHODS:
                 raise HTTPBadRequest()
@@ -462,6 +468,8 @@ class App(Generic[_ReqT, _RespT]):
         except Exception as ex:
             if not self._handle_exception(req, resp, ex, params):
                 raise
+
+            error_status = resp.status
         else:
             try:
                 # NOTE(kgriffs): If the request did not match any
@@ -485,26 +493,59 @@ class App(Generic[_ReqT, _RespT]):
                 if not self._handle_exception(req, resp, ex, params):
                     raise
 
+                error_status = resp.status
+
         # Call process_response middleware methods.
         for process_response in mw_resp_stack or dependent_mw_resp_stack:
             try:
                 process_response(req, resp, resource, req_succeeded)
             except Exception as ex:
+                req_succeeded = False
+
+                if error_status is None:
+                    # NOTE: The error handler is committed for the first
+                    #   exception only. Exceptions raised by subsequent
+                    #   response middleware steps must not overwrite the
+                    #   already-committed error response; these are logged
+                    #   while the remaining eligible steps still run.
+                    if not self._handle_exception(req, resp, ex, params):
+                        raise
+
+                    error_status = resp.status
+                else:
+                    req.log_error(traceback.format_exc())
+            finally:
+                if error_status is not None and resp.status != error_status:
+                    # NOTE: Response middleware may add headers on the error
+                    #   path, but the status chosen by the error handler is
+                    #   committed exactly once and may not be overridden.
+                    resp.status = error_status
+
+        body: Iterable[bytes]
+        length: int | None
+
+        # NOTE: start_response() has not been called yet, so the response
+        #   must not be partially emitted. If rendering the body raises, the
+        #   (first) error handler gets one chance to compose an alternative
+        #   response, which is then rendered instead of the failed one. If that
+        #   rendering also fails, the exception is propagated to the WSGI
+        #   server rather than being fed back to error handling (which would
+        #   conflate it with the original exception).
+        while True:
+            try:
+                body, length = self._get_body(resp, env.get('wsgi.file_wrapper'))
+            except Exception as ex:
+                if error_status is not None:
+                    raise
+
                 if not self._handle_exception(req, resp, ex, params):
                     raise
 
+                error_status = resp.status
                 req_succeeded = False
+                continue
 
-        body: Iterable[bytes] = []
-        length: int | None = 0
-
-        try:
-            body, length = self._get_body(resp, env.get('wsgi.file_wrapper'))
-        except Exception as ex:
-            if not self._handle_exception(req, resp, ex, params):
-                raise
-
-            req_succeeded = False
+            break
 
         resp_status: str = code_to_http_status(resp.status)
         default_media_type: str | None = self.resp_options.default_media_type
@@ -1260,26 +1301,35 @@ class App(Generic[_ReqT, _RespT]):
         Returns:
             bool: ``True`` if a handler was found and called for the
             exception, ``False`` otherwise.
+
+        Note:
+            Any exception raised by the matched error handler itself (other
+            than an :class:`~.HTTPError` or :class:`~.HTTPStatus` used to
+            describe the response), including an error serializer failure, is
+            allowed to propagate from this method instead of being passed back
+            to error handling. This keeps such a secondary exception distinct
+            from the original one, and ensures that the error handler is only
+            invoked once for the same failure.
         """
         err_handler = self._find_error_handler(ex)
 
         # NOTE(caselit): Reset body, data and media before calling the handler
         resp.text = resp.data = resp.media = None
-        if err_handler is not None:
-            try:
-                err_handler(req, resp, ex, params)
-            except HTTPStatus as status:
-                self._compose_status_response(req, resp, status)
-            except HTTPError as error:
-                self._compose_error_response(req, resp, error)
+        if err_handler is None:
+            # NOTE(kgriffs): No error handlers are defined for ex
+            # and it is not one of (HTTPStatus, HTTPError), since it
+            # would have matched one of the corresponding default
+            # handlers.
+            return False
 
-            return True
+        try:
+            err_handler(req, resp, ex, params)
+        except HTTPStatus as status:
+            self._compose_status_response(req, resp, status)
+        except HTTPError as error:
+            self._compose_error_response(req, resp, error)
 
-        # NOTE(kgriffs): No error handlers are defined for ex
-        # and it is not one of (HTTPStatus, HTTPError), since it
-        # would have matched one of the corresponding default
-        # handlers.
-        return False
+        return True
 
     # PERF(kgriffs): Moved from api_helpers since it is slightly faster
     # to call using self, and this function is called for most

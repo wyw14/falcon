@@ -378,10 +378,11 @@ class TestSeveralMiddlewares(TestMiddleware):
         assert expectedExecutedMethods == context['executed_methods']
 
     def test_multiple_response_mw_throw_exception(self, asgi, util):
-        """Test that error in inner middleware leaves"""
+        """Test that the first response-mw error commits the response once."""
         global context
 
         context['req_succeeded'] = []
+        handled = []
 
         class RaiseStatusMiddleware:
             def process_response(self, req, resp, resource, req_succeeded):
@@ -396,6 +397,10 @@ class TestSeveralMiddlewares(TestMiddleware):
                 context['executed_methods'].append('process_response')
                 context['req_succeeded'].append(req_succeeded)
 
+        def handle_http_error(req, resp, ex, params):
+            handled.append(ex.status_code)
+            raise ex
+
         app = util.create_app(
             asgi,
             middleware=[
@@ -406,17 +411,173 @@ class TestSeveralMiddlewares(TestMiddleware):
                 ProcessResponseMiddleware(),
             ],
         )
+        app.add_error_handler(falcon.HTTPError, handle_http_error)
 
         app.add_route(TEST_ROUTE, MiddlewareClassResource())
         client = testing.TestClient(app)
 
         response = client.simulate_request(path=TEST_ROUTE)
 
-        assert response.status == falcon.HTTP_748
+        # NOTE: The first raised error (HTTP 201) commits the status exactly
+        #   once. The subsequent 748 raised by another response middleware
+        #   must not trigger the error handler again nor override the status.
+        assert response.status == falcon.HTTP_201
+        assert handled == []
 
         expected_methods = ['process_response'] * 3
         assert context['executed_methods'] == expected_methods
         assert context['req_succeeded'] == [True, False, False]
+
+    @pytest.mark.parametrize('independent_middleware', [True, False])
+    def test_response_mw_may_not_override_committed_error_status(
+        self, asgi, util, independent_middleware
+    ):
+        """Response middleware headers survive an error, its status does not."""
+
+        class RaiseRequestMiddleware:
+            def process_request(self, req, resp):
+                raise falcon.HTTPForbidden()
+
+            async def process_request_async(self, req, resp):
+                self.process_request(req, resp)
+
+        class OverrideStatusResponseMiddleware:
+            def process_response(self, req, resp, resource, req_succeeded):
+                resp.status = falcon.HTTP_201
+                resp.set_header('X-Error-Path', 'yes')
+
+            async def process_response_async(self, req, resp, resource, req_succeeded):
+                self.process_response(req, resp, resource, req_succeeded)
+
+        app = util.create_app(
+            asgi,
+            independent_middleware=independent_middleware,
+            middleware=[
+                # NOTE: The header middleware is placed outermost so that its
+                #   response step is eligible in both independent and
+                #   dependent modes.
+                OverrideStatusResponseMiddleware(),
+                RaiseRequestMiddleware(),
+            ],
+        )
+        app.add_route(TEST_ROUTE, MiddlewareClassResource())
+        client = testing.TestClient(app)
+
+        response = client.simulate_request(path=TEST_ROUTE)
+
+        assert response.status == falcon.HTTP_403
+        assert response.headers['X-Error-Path'] == 'yes'
+        assert response.json['title'] == '403 Forbidden'
+
+    @pytest.mark.parametrize('independent_middleware', [True, False])
+    def test_independent_option_gates_response_steps_after_request_error(
+        self, asgi, util, independent_middleware
+    ):
+        """independent_middleware decides which response steps still execute."""
+
+        class _Base:
+            def __init__(self, name, *, raises=False):
+                self.name = name
+                self.raises = raises
+
+            def _record_response(self):
+                context['executed_methods'].append(self.name + '.process_response')
+
+            def process_response(self, req, resp, resource, req_succeeded):
+                self._record_response()
+
+            async def process_response_async(self, req, resp, resource, req_succeeded):
+                self._record_response()
+
+        class FullMiddleware(_Base):
+            def process_request(self, req, resp):
+                context['executed_methods'].append(self.name + '.process_request')
+                if self.raises:
+                    raise falcon.HTTPForbidden()
+
+            async def process_request_async(self, req, resp):
+                self.process_request(req, resp)
+
+        app = util.create_app(
+            asgi,
+            independent_middleware=independent_middleware,
+            middleware=[
+                _Base('early_response_only'),
+                FullMiddleware('failing', raises=True),
+                FullMiddleware('later'),
+                _Base('late_response_only'),
+            ],
+        )
+        app.add_route(TEST_ROUTE, MiddlewareClassResource())
+        client = testing.TestClient(app)
+
+        response = client.simulate_request(path=TEST_ROUTE)
+
+        assert response.status == falcon.HTTP_403
+
+        if independent_middleware:
+            # NOTE: Every registered response step runs in reverse order.
+            expected_methods = [
+                'failing.process_request',
+                'late_response_only.process_response',
+                'later.process_response',
+                'failing.process_response',
+                'early_response_only.process_response',
+            ]
+        else:
+            # NOTE: The failing component's own response and all steps below
+            #   it in the stack are skipped; only the already-entered outer
+            #   step runs.
+            expected_methods = [
+                'failing.process_request',
+                'early_response_only.process_response',
+            ]
+
+        assert context['executed_methods'] == expected_methods
+
+    def test_single_handler_pass_for_response_mw_errors(self, asgi, util):
+        """Several response mw errors invoke the error handler only once."""
+        calls = []
+
+        class RaiseErrorMiddleware:
+            def __init__(self, name):
+                self.name = name
+
+            def process_response(self, req, resp, resource, req_succeeded):
+                calls.append(self.name + '.process_response')
+                raise RuntimeError(self.name)
+
+            async def process_response_async(self, req, resp, resource, req_succeeded):
+                self.process_response(req, resp, resource, req_succeeded)
+
+        def handle_runtime_error(req, resp, ex, params):
+            calls.append('handler')
+            resp.status = falcon.HTTP_400
+            resp.text = 'handled'
+
+        app = util.create_app(
+            asgi,
+            middleware=[
+                RaiseErrorMiddleware('outer'),
+                RaiseErrorMiddleware('middle'),
+                RaiseErrorMiddleware('inner'),
+            ],
+        )
+        app.add_error_handler(RuntimeError, handle_runtime_error)
+
+        app.add_route(TEST_ROUTE, MiddlewareClassResource())
+        client = testing.TestClient(app)
+
+        response = client.simulate_request(path=TEST_ROUTE)
+
+        assert response.status == falcon.HTTP_400
+        assert response.text == 'handled'
+        assert calls == [
+            'inner.process_response',
+            'handler',
+            'middle.process_response',
+            'outer.process_response',
+        ]
 
     def test_inner_mw_throw_exception(self, asgi, util):
         """Test that error in inner middleware leaves"""

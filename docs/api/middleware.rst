@@ -415,3 +415,18 @@ or the routed ``on_*`` responder method itself raises an error, the
 exception will be handled in a similar manner as above. Then,
 the framework will execute any remaining middleware on the
 stack.
+
+.. Note::
+
+    The first error that is handled while processing a request commits the
+    response status and body exactly once. The remaining *process_response*
+    methods may still add headers to the error response, but they can not
+    override the committed status. If one of these remaining methods raises
+    another error, it is logged instead of invoking the error handler again or
+    replacing the already-committed response.
+
+    Before the response has started, if serializing or rendering the body
+    raises, the framework renders the error response once more instead of
+    emitting a partial response. However, if an error handler (or the error
+    serializer) itself raises, that exception is propagated to the application
+    server, and it is kept distinct from the original one.
