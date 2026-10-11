@@ -162,29 +162,37 @@ cdef class BufferedReader:
         return result + self._buffer[:read_size]
 
     def read_until(self, bytes delimiter not None, size=-1,
-                   consume_delimiter=False):
+                   consume_delimiter=False, *, require_delimiter=False):
         cdef Py_ssize_t read_size = self._normalize_size(size)
         cdef result
 
         read_size = self._normalize_size(size)
         if read_size <= self._max_join_size:
-            return self._read_until(delimiter, read_size, consume_delimiter)
+            return self._read_until(
+                delimiter, read_size, consume_delimiter, require_delimiter)
 
         # NOTE(vytas): A large size was requested, optimize for memory
-        #   consumption by avoiding to momentarily keep both the chunks and the
-        #   joint result in memory at the same time.
+        # consumption by avoiding to momentarily keep both the chunks and the
+        # joint result in memory at the same time.
         result = io.BytesIO()
         self.pipe_until(delimiter, result, consume_delimiter, read_size)
+        if require_delimiter and not consume_delimiter:
+            if self.peek(len(delimiter)) != delimiter:
+                raise DelimiterError('delimiter not found before end of stream')
         return result.getvalue()
 
     cdef _finalize_read_until(
         self, Py_ssize_t size, backlog, Py_ssize_t have_bytes,
         Py_ssize_t consume_bytes, bytes delimiter=None,
         Py_ssize_t delimiter_pos=-1,
-        bytes next_chunk=None, Py_ssize_t next_chunk_len=0):
+        bytes next_chunk=None, Py_ssize_t next_chunk_len=0,
+        bint require_delimiter=False):
 
         if delimiter_pos < 0 and delimiter is not None:
             delimiter_pos = self._buffer.find(delimiter, self._buffer_pos)
+
+        if require_delimiter and delimiter_pos < 0:
+            raise DelimiterError('delimiter not found before end of stream')
 
         if delimiter_pos >= 0:
             size = min(size, have_bytes + delimiter_pos - self._buffer_pos)
@@ -221,7 +229,7 @@ cdef class BufferedReader:
         return ret_value
 
     cdef _read_until(self, bytes delimiter, Py_ssize_t size,
-                     bint consume_delimiter):
+                     bint consume_delimiter, bint require_delimiter=False):
         cdef list result = []
         cdef Py_ssize_t have_bytes = 0
         cdef Py_ssize_t delimiter_len_1 = len(delimiter) - 1
@@ -274,7 +282,8 @@ cdef class BufferedReader:
                 self._buffer_len += next_chunk_len
                 self._buffer += next_chunk
                 return self._finalize_read_until(
-                    size, result, have_bytes, consume_bytes, delimiter)
+                    size, result, have_bytes, consume_bytes, delimiter,
+                    require_delimiter=require_delimiter)
 
             # NOTE(vytas): The buffer was empty before, skip straight to the
             #   next chunk.
@@ -375,8 +384,9 @@ cdef class BufferedReader:
     def exhaust(self):
         self.pipe()
 
-    def delimit(self, delimiter):
-        read = functools.partial(self.read_until, delimiter)
+    def delimit(self, delimiter, require_delimiter=False):
+        read = functools.partial(
+            self.read_until, delimiter, require_delimiter=require_delimiter)
         return type(self)(read, self._normalize_size(None), self._chunk_size)
 
     def readline(self, size=-1):

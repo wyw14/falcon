@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from collections.abc import Awaitable
+import os
+import tempfile
 from typing import (
     Any,
     TYPE_CHECKING,
@@ -27,6 +29,8 @@ from falcon._typing import _UNSET
 from falcon.asgi.reader import BufferedReader
 from falcon.errors import DelimiterError
 from falcon.media import multipart
+from falcon.media.multipart import CollectedForm
+from falcon.media.multipart import StoredFile
 from falcon.typing import AsyncReadableIO
 from falcon.util.mediatypes import parse_header
 
@@ -80,7 +84,12 @@ class BodyPart(multipart.BodyPart):
     async def get_data(self) -> bytes:  # type: ignore[override]
         if self._data is None:
             max_size = self._parse_options.max_body_part_buffer_size + 1
-            self._data = await self.stream.read(max_size)
+            try:
+                self._data = await self.stream.read(max_size)
+            except DelimiterError as ex:
+                raise MultipartParseError(
+                    description='unexpected form structure'
+                ) from ex
             if len(self._data) >= max_size:
                 raise MultipartParseError(description='body part is too large')
 
@@ -193,6 +202,7 @@ class MultipartForm:
         #   (see the note below).
         self._dash_boundary = b'--' + boundary
         self._parse_options = parse_options
+        self._collect_error: MultipartParseError | None = None
 
     def __aiter__(self) -> AsyncIterator[BodyPart]:
         return self._iterate_parts()
@@ -280,4 +290,82 @@ class MultipartForm:
                     description='maximum number of form body parts exceeded'
                 )
 
-            yield BodyPart(stream.delimit(delimiter), headers, self._parse_options)
+            yield BodyPart(
+                stream.delimit(delimiter, require_delimiter=True),
+                headers,
+                self._parse_options,
+            )
+
+    async def collect(self) -> CollectedForm:
+        """Asynchronously read out the form and collect its parts.
+
+        This method is the asynchronous counterpart of
+        :meth:`falcon.media.multipart.MultipartForm.collect`. Text fields
+        and spooled file parts are kept separate; see
+        :class:`~falcon.media.multipart.CollectedForm` for details. If parsing
+        fails midway, all the already spooled files are released before the
+        :class:`MultipartParseError` is propagated, and follow-up calls raise
+        the same error.
+
+        Returns:
+            CollectedForm: The collected fields and file parts.
+        """
+        if self._collect_error is not None:
+            raise self._collect_error
+
+        collected = CollectedForm()
+        error: MultipartParseError | None = None
+        try:
+            async for part in self:
+                if part.filename is not None:
+                    file = await self._spool_file(part)
+                    collected._add_file(part, StoredFile(part, file))
+                else:
+                    value = await part.text
+                    if value is None:
+                        # NOTE: Non-text-plain part without a filename;
+                        #   decode its bytes.
+                        value = (await part.data).decode(
+                            self._parse_options.default_charset
+                        )
+                    collected._add_field_value(part.name, value)
+        except MultipartParseError as ex:
+            error = ex
+        except DelimiterError as ex:
+            error = MultipartParseError(description='unexpected form structure')
+            error.__cause__ = ex
+        except Exception as ex:
+            error = MultipartParseError(description='unexpected form structure')
+            error.__cause__ = ex
+        except BaseException:
+            collected.close()
+            raise
+
+        if error is not None:
+            collected.close()
+            self._collect_error = error
+            raise error
+
+        return collected
+
+    async def _spool_file(
+        self, part: BodyPart
+    ) -> tempfile._TemporaryFileWrapper:
+        file = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            stream = part.stream
+            while True:
+                chunk = await stream.read(65536)
+                if not chunk:
+                    break
+                file.write(chunk)
+            file.flush()
+        except BaseException:
+            file.close()
+            try:
+                os.unlink(file.name)
+            except FileNotFoundError:
+                pass
+            raise
+        file.seek(0)
+        return file

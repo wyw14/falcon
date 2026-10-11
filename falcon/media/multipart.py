@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+import os
 import re
+import tempfile
 from typing import (
     Any,
     ClassVar,
@@ -30,6 +32,7 @@ from urllib.parse import unquote_to_bytes
 from falcon import errors
 from falcon._typing import _UNSET
 from falcon._typing import UnsetOr
+from falcon.errors import DelimiterError
 from falcon.errors import MultipartParseError
 from falcon.media.base import BaseHandler
 from falcon.stream import BoundedStream
@@ -137,7 +140,12 @@ class BodyPart:
         """
         if self._data is None:
             max_size = self._parse_options.max_body_part_buffer_size + 1
-            self._data = self.stream.read(max_size)
+            try:
+                self._data = self.stream.read(max_size)
+            except DelimiterError as ex:
+                raise MultipartParseError(
+                    description='unexpected form structure'
+                ) from ex
             if len(self._data) >= max_size:
                 raise MultipartParseError(description='body part is too large')
 
@@ -361,6 +369,7 @@ class MultipartForm:
         #   (see the note below).
         self._dash_boundary = b'--' + boundary
         self._parse_options = parse_options
+        self._collect_error: MultipartParseError | None = None
 
     def __iter__(self) -> Iterator[BodyPart]:
         prologue = True
@@ -445,7 +454,263 @@ class MultipartForm:
                     description='maximum number of form body parts exceeded'
                 )
 
-            yield BodyPart(stream.delimit(delimiter), headers, self._parse_options)
+            yield BodyPart(
+                stream.delimit(delimiter, require_delimiter=True),
+                headers,
+                self._parse_options,
+            )
+
+    def collect(self) -> CollectedForm:
+        """Read out the whole form, and collect its fields and file parts.
+
+        Unlike lazy iteration, every part is consumed during this call:
+        normal text fields are collected by their name (preserving all
+        values and their order, without overwriting each other), while file
+        parts are spooled into temporary files and exposed separately as
+        :class:`StoredFile` instances.
+
+        The returned :class:`CollectedForm` owns the spooled files; it should
+        be closed (or used as a context manager) to release them. If parsing
+        fails midway, all the already spooled files are released before the
+        :class:`MultipartParseError` is propagated, and follow-up calls raise
+        the same error.
+
+        Returns:
+            CollectedForm: The collected fields and file parts.
+        """
+        if self._collect_error is not None:
+            raise self._collect_error
+
+        collected = CollectedForm()
+        error: MultipartParseError | None = None
+        try:
+            for part in self:
+                if part.filename is not None:
+                    file = self._spool_file(part)
+                    collected._add_file(part, StoredFile(part, file))
+                else:
+                    value = part.text
+                    if value is None:
+                        # NOTE: Non-text-plain part without a filename;
+                        #   decode its bytes.
+                        value = part.data.decode(
+                            self._parse_options.default_charset
+                        )
+                    collected._add_field_value(part.name, value)
+        except MultipartParseError as ex:
+            error = ex
+        except DelimiterError as ex:
+            error = MultipartParseError(description='unexpected form structure')
+            error.__cause__ = ex
+        except Exception as ex:
+            error = MultipartParseError(description='unexpected form structure')
+            error.__cause__ = ex
+        except BaseException:
+            collected.close()
+            raise
+
+        if error is not None:
+            collected.close()
+            self._collect_error = error
+            raise error
+
+        return collected
+
+    def _spool_file(self, part: BodyPart) -> tempfile._TemporaryFileWrapper:
+        file = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            stream = part.stream
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                file.write(chunk)
+            file.flush()
+        except BaseException:
+            file.close()
+            try:
+                os.unlink(file.name)
+            except FileNotFoundError:
+                pass
+            raise
+        file.seek(0)
+        return file
+
+
+class StoredFile:
+    """A file part that has been spooled into a temporary file.
+
+    StoredFile instances are created by :meth:`MultipartForm.collect` (or its
+    asynchronous counterpart), and remain independently readable after the
+    multipart form has been fully consumed. The underlying temporary file is
+    released via :meth:`close`, or automatically when the owning
+    :class:`CollectedForm` is closed.
+    """
+
+    def __init__(
+        self,
+        part: BodyPart,
+        file: tempfile._TemporaryFileWrapper,
+    ) -> None:
+        self._part = part
+        self._file: tempfile._TemporaryFileWrapper | None = file
+        self.path: str = file.name
+        """Path of the temporary file that stores the file part content."""
+
+    @property
+    def name(self) -> str | None:
+        """The form field name, as per the Content-Disposition header."""
+        return self._part.name
+
+    @property
+    def filename(self) -> str | None:
+        """The client-supplied file name, decoded as necessary."""
+        return self._part.filename
+
+    @property
+    def content_type(self) -> str:
+        """Value of the part's Content-Type header."""
+        return self._part.content_type
+
+    @property
+    def secure_filename(self) -> str:
+        """The sanitized version of the client-supplied file name."""
+        return self._part.secure_filename
+
+    @property
+    def data(self) -> bytes:
+        """The complete file part content read from the temporary file."""
+        if self._file is None:
+            raise ValueError('I/O operation on closed file.')
+        self._file.seek(0)
+        return self._file.read()
+
+    def read(self, size: int = -1) -> bytes:
+        """Read up to size bytes from the temporary file.
+
+        Args:
+            size: Maximum number of bytes to read. When omitted or -1, all
+                remaining bytes are read.
+
+        Returns:
+            bytes: The file part content read.
+        """
+        if self._file is None:
+            raise ValueError('I/O operation on closed file.')
+        return self._file.read(size)
+
+    def close(self) -> None:
+        """Close and remove the underlying temporary file.
+
+        This method is idempotent; follow-up calls have no effect.
+        """
+        file = self._file
+        if file is not None:
+            self._file = None
+            file.close()
+            try:
+                os.unlink(file.name)
+            except FileNotFoundError:
+                pass
+
+    def __enter__(self) -> StoredFile:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+
+class CollectedForm:
+    """Eagerly collected view of a multipart form.
+
+    Text fields and file parts are kept separate, keyed by the original form
+    field name. Multiple parts sharing a name are retained as lists in the
+    same order as they appeared in the request.
+
+    CollectedForm instances are returned by :meth:`MultipartForm.collect`
+    (and its asynchronous counterpart). Close the object, or use it as a
+    context manager, to release all spooled file parts.
+    """
+
+    def __init__(self) -> None:
+        self.fields: dict[str | None, list[str]] = {}
+        """Mapping of field names to their text values in request order."""
+        self.files: dict[str | None, list[StoredFile]] = {}
+        """Mapping of field names to their file parts in request order."""
+
+    def get(self, name: str, default: str | None = None) -> str | None:
+        """Return the first value of the specified text field.
+
+        Args:
+            name: Field name to look up.
+            default: Value to return when the field is absent.
+
+        Returns:
+            str: The first field value, or default when absent.
+        """
+        values = self.fields.get(name)
+        return values[0] if values else default
+
+    def getlist(self, name: str) -> list[str]:
+        """Return all values of the specified text field in request order.
+
+        Args:
+            name: Field name to look up.
+
+        Returns:
+            list: The field values, or an empty list when absent.
+        """
+        return self.fields.get(name, [])
+
+    def getfile(self, name: str) -> StoredFile | None:
+        """Return the first file part with the specified name.
+
+        Args:
+            name: Field name to look up.
+
+        Returns:
+            StoredFile: The file part, or ``None`` when absent.
+        """
+        files = self.files.get(name)
+        return files[0] if files else None
+
+    def getfilelist(self, name: str) -> list[StoredFile]:
+        """Return all file parts with the specified name in request order.
+
+        Args:
+            name: Field name to look up.
+
+        Returns:
+            list: The file parts, or an empty list when absent.
+        """
+        return self.files.get(name, [])
+
+    def close(self) -> None:
+        """Release every spooled file part.
+
+        This method is idempotent; follow-up calls have no effect.
+        """
+        for files in self.files.values():
+            for stored in files:
+                stored.close()
+
+    def _add_field_value(self, name: str | None, value: str) -> None:
+        self.fields.setdefault(name, []).append(value)
+
+    def _add_file(self, part: BodyPart, stored: StoredFile) -> None:
+        self.files.setdefault(part.name, []).append(stored)
+
+    def __enter__(self) -> CollectedForm:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self.close()
+
+    async def __aenter__(self) -> CollectedForm:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        self.close()
 
 
 class MultipartFormHandler(BaseHandler):

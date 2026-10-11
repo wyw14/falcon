@@ -1,14 +1,20 @@
+import asyncio
 import io
 import itertools
 import os
 import random
+import tempfile
 
 import pytest
 
 import falcon
 from falcon import media
 from falcon import testing
+from falcon.errors import DelimiterError
+from falcon.media.multipart import CollectedForm
+from falcon.media.multipart import MultipartParseError
 from falcon.media.multipart import MultipartParseOptions
+from falcon.asgi.reader import BufferedReader as AsyncBufferedReader
 from falcon.util import BufferedReader
 
 
@@ -930,3 +936,500 @@ def test_multipart_parse_options_default_handlers_unique():
     assert parse_options_one.media_handlers is not parse_options_two.media_handlers
     assert len(parse_options_one.media_handlers) == 1
     assert len(parse_options_two.media_handlers) >= 2
+
+
+# ---------------------------------------------------------------------------
+# Form collection: field/file isolation, cleanup, and error behavior.
+# ---------------------------------------------------------------------------
+
+
+COLLECT_EXAMPLE = (
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="x"\r\n\r\n'
+    b'one\r\n'
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="x"\r\n\r\n'
+    b'two\r\n'
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="x"; filename="a.txt"\r\n'
+    b'Content-Type: text/plain\r\n\r\n'
+    b'filedata\r\n'
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="docs"; '
+    b'filename="\xe6\x8a\xa5\xe5\x91\x8a.txt"\r\n'
+    b'Content-Type: text/plain\r\n\r\n'
+    b'AAA\r\n'
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="docs"; filename="plain.txt"\r\n'
+    b'Content-Type: text/plain\r\n\r\n'
+    b'BBB\r\n'
+    b'--B--\r\n'
+)
+
+EMPTY_FILE_EXAMPLE = (
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="only"\r\n\r\n'
+    b'value\r\n'
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="up"; filename="empty.txt"\r\n'
+    b'Content-Type: application/octet-stream\r\n\r\n\r\n'
+    b'--B--\r\n'
+)
+
+# Boundary line is corrupted after a valid first part; a valid part follows.
+CORRUPTED_BOUNDARY_EXAMPLE = (
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="a"\r\n\r\n'
+    b'AAA\r\n'
+    b'--B-corrupted\r\n'
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="b"\r\n\r\n'
+    b'BBB\r\n'
+    b'--B--\r\n'
+)
+
+NO_BOUNDARY_EXAMPLE = b'totally unrelated content without any boundary'
+
+
+class _Collector:
+    def _describe(self, form):
+        return {
+            'fields': form.fields,
+            'files': [
+                {
+                    'content_type': stored.content_type,
+                    'data': stored.data.decode(),
+                    'filename': stored.filename,
+                    'name': stored.name,
+                }
+                for stored_list in form.files.values()
+                for stored in stored_list
+            ],
+        }
+
+
+class MultipartCollector(_Collector):
+    def on_post(self, req, resp):
+        with req.media.collect() as form:
+            resp.media = self._describe(form)
+
+
+class AsyncMultipartCollector(_Collector):
+    async def on_post(self, req, resp):
+        form = await req.get_media()
+        async with await form.collect() as collected:
+            resp.media = self._describe(collected)
+
+
+@pytest.fixture
+def collect_client(asgi, util):
+    app = util.create_app(asgi)
+    resource = AsyncMultipartCollector() if asgi else MultipartCollector()
+    app.add_route('/collect', resource)
+    return testing.TestClient(app)
+
+
+def _post(client, body):
+    return client.simulate_post(
+        '/collect',
+        headers={'Content-Type': 'multipart/form-data; boundary=B'},
+        body=body,
+    )
+
+
+def test_collect_fields_and_files(collect_client):
+    resp = _post(collect_client, COLLECT_EXAMPLE)
+
+    assert resp.status_code == 200
+    assert resp.json == {
+        'fields': {'x': ['one', 'two']},
+        'files': [
+            {
+                'content_type': 'text/plain',
+                'data': 'filedata',
+                'filename': 'a.txt',
+                'name': 'x',
+            },
+            {
+                'content_type': 'text/plain',
+                'data': 'AAA',
+                'filename': '报告.txt',
+                'name': 'docs',
+            },
+            {
+                'content_type': 'text/plain',
+                'data': 'BBB',
+                'filename': 'plain.txt',
+                'name': 'docs',
+            },
+        ],
+    }
+
+
+def test_collect_single_field_and_empty_file(collect_client):
+    resp = _post(collect_client, EMPTY_FILE_EXAMPLE)
+
+    assert resp.status_code == 200
+    assert resp.json == {
+        'fields': {'only': ['value']},
+        'files': [
+            {
+                'content_type': 'application/octet-stream',
+                'data': '',
+                'filename': 'empty.txt',
+                'name': 'up',
+            },
+        ],
+    }
+
+
+def test_collect_boundary_never_appears(collect_client):
+    resp = _post(collect_client, NO_BOUNDARY_EXAMPLE)
+
+    assert resp.status_code == 400
+    assert resp.json == {
+        'description': 'unexpected form structure',
+        'title': 'Malformed multipart/form-data request media',
+    }
+
+
+def test_collect_corrupted_boundary(collect_client):
+    resp = _post(collect_client, CORRUPTED_BOUNDARY_EXAMPLE)
+
+    assert resp.status_code == 400
+    assert resp.json == {
+        'description': 'unexpected form structure',
+        'title': 'Malformed multipart/form-data request media',
+    }
+
+
+def _parse_direct(body):
+    handler = media.MultipartFormHandler()
+    return handler.deserialize(
+        io.BytesIO(body), 'multipart/form-data; boundary=B', len(body)
+    )
+
+
+def test_collect_releases_tempfiles_on_failure(tmp_path):
+    original_tempdir = tempfile.tempdir
+    tempfile.tempdir = str(tmp_path)
+    try:
+        try:
+            _parse_direct(CORRUPTED_BOUNDARY_EXAMPLE).collect()
+        except MultipartParseError:
+            pass
+        assert not os.listdir(tmp_path)
+
+        # Successful collection likewise leaves nothing behind after close.
+        form = _parse_direct(COLLECT_EXAMPLE).collect()
+        paths = [
+            stored.path
+            for files in form.files.values()
+            for stored in files
+        ]
+        assert paths and all(os.path.exists(path) for path in paths)
+        form.close()
+        assert not os.listdir(tmp_path)
+    finally:
+        tempfile.tempdir = original_tempdir
+
+
+def test_collect_error_is_cached():
+    form = _parse_direct(CORRUPTED_BOUNDARY_EXAMPLE)
+
+    with pytest.raises(MultipartParseError) as first:
+        form.collect()
+    with pytest.raises(MultipartParseError) as second:
+        form.collect()
+
+    assert first.value.description == second.value.description
+    assert first.value.status == second.value.status
+
+
+async def test_collect_error_is_cached_async():
+    queue = asyncio.Queue()
+
+    class FakeStream:
+        async def __aiter__(self):
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    return
+                yield chunk
+
+    body = CORRUPTED_BOUNDARY_EXAMPLE
+    for index in range(0, len(body), 11):
+        await queue.put(body[index : index + 11])
+    await queue.put(None)
+
+    reader = AsyncBufferedReader(FakeStream())
+    handler = media.MultipartFormHandler()
+    form = await handler.deserialize_async(
+        reader, 'multipart/form-data; boundary=B', None
+    )
+    with pytest.raises(MultipartParseError) as first:
+        await form.collect()
+    with pytest.raises(MultipartParseError) as second:
+        await form.collect()
+
+    assert first.value.description == second.value.description
+    assert first.value.status == second.value.status
+
+
+# Body parts without the closing inter-part delimiter.
+NO_CLOSING_FILE = (
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="f"; filename="a.txt"\r\n'
+    b'Content-Type: text/plain\r\n\r\n'
+    b'AAA'
+)
+
+NON_TEXT_FIELD = (
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="doc"\r\n'
+    b'Content-Type: application/json\r\n\r\n'
+    b'{"a": 1}\r\n'
+    b'--B--\r\n'
+)
+
+NON_TEXT_FIELD_INVALID = (
+    b'--B\r\n'
+    b'Content-Disposition: form-data; name="raw"\r\n'
+    b'Content-Type: application/octet-stream\r\n\r\n'
+    b'\xff\xfe\r\n'
+    b'--B--\r\n'
+)
+
+
+@pytest.mark.parametrize(
+    'body',
+    [NO_CLOSING_FILE, NON_TEXT_FIELD_INVALID],
+    ids=['missing-delimiter', 'undecodable-field'],
+)
+def test_collect_error_paths_sync(body):
+    with pytest.raises(MultipartParseError) as expected:
+        _parse_direct(body).collect()
+    assert expected.value.status == '400 Bad Request'
+    assert expected.value.description == 'unexpected form structure'
+    assert isinstance(expected.value.__cause__, Exception)
+
+
+async def test_collect_error_paths_async():
+    for body in (NO_CLOSING_FILE, NON_TEXT_FIELD_INVALID):
+        queue = asyncio.Queue()
+
+        class FakeStream:
+            async def __aiter__(self):
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        return
+                    yield chunk
+
+        for index in range(0, len(body), 5):
+            await queue.put(body[index : index + 5])
+        await queue.put(None)
+
+        reader = AsyncBufferedReader(FakeStream())
+        handler = media.MultipartFormHandler()
+        form = await handler.deserialize_async(
+            reader, 'multipart/form-data; boundary=B', None
+        )
+        with pytest.raises(MultipartParseError) as expected:
+            await form.collect()
+        assert expected.value.description == 'unexpected form structure'
+        assert isinstance(expected.value.__cause__, BaseException)
+
+
+def test_collect_non_text_field_fallback():
+    with _parse_direct(NON_TEXT_FIELD).collect() as collected:
+        assert collected.fields == {'doc': ['{"a": 1}']}
+
+
+def test_read_until_large_require_delimiter():
+    source = io.BytesIO(os.urandom(200_000))
+    reader = BufferedReader(source.read, 200_000, chunk_size=1024)
+    # NOTE: size exceeds the large-read threshold (chunk_size * 128).
+    with pytest.raises(DelimiterError):
+        reader.read_until(b'404', 200_000, require_delimiter=True)
+
+
+def test_spool_interrupted_sync(monkeypatch, tmp_path):
+    original_tempdir = tempfile.tempdir
+    tempfile.tempdir = str(tmp_path)
+    original_read = BufferedReader.read
+
+    def interrupted(self, *args, **kwargs):
+        # NOTE: The spool loop always reads chunks of 64 KiB.
+        if kwargs.get('size', args[0] if args else -1) == 65536:
+            raise KeyboardInterrupt
+        return original_read(self, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(BufferedReader, 'read', interrupted)
+
+        real_unlink = os.unlink
+
+        def missing_file(path):
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr(os, 'unlink', missing_file)
+        with pytest.raises(KeyboardInterrupt):
+            _parse_direct(COLLECT_EXAMPLE).collect()
+
+        # NOTE: The spool cleanup's unlink simulated failure; remove any
+        #   leftover with the real function.
+        for leftover in os.listdir(tmp_path):
+            real_unlink(os.path.join(tmp_path, leftover))
+        assert not os.listdir(tmp_path)
+    finally:
+        tempfile.tempdir = original_tempdir
+        monkeypatch.setattr(BufferedReader, 'read', original_read)
+
+
+async def test_spool_interrupted_async(monkeypatch, tmp_path):
+    original_tempdir = tempfile.tempdir
+    tempfile.tempdir = str(tmp_path)
+    original_read = AsyncBufferedReader.read
+
+    async def interrupted(self, *args, **kwargs):
+        # NOTE: The spool loop always reads chunks of 64 KiB.
+        if kwargs.get('size', args[0] if args else -1) == 65536:
+            raise KeyboardInterrupt
+        return await original_read(self, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(AsyncBufferedReader, 'read', interrupted)
+
+        real_unlink = os.unlink
+
+        def missing_file(path):
+            raise FileNotFoundError(path)
+
+        monkeypatch.setattr(os, 'unlink', missing_file)
+
+        queue = asyncio.Queue()
+
+        class FakeStream:
+            async def __aiter__(self):
+                while True:
+                    chunk = await queue.get()
+                    if chunk is None:
+                        return
+                    yield chunk
+
+        body = COLLECT_EXAMPLE
+        await queue.put(body)
+        await queue.put(None)
+
+        reader = AsyncBufferedReader(FakeStream())
+        handler = media.MultipartFormHandler()
+        form = await handler.deserialize_async(
+            reader, 'multipart/form-data; boundary=B', None
+        )
+        with pytest.raises(KeyboardInterrupt):
+            await form.collect()
+        for leftover in os.listdir(tmp_path):
+            real_unlink(os.path.join(tmp_path, leftover))
+        assert not os.listdir(tmp_path)
+    finally:
+        tempfile.tempdir = original_tempdir
+
+
+def test_stored_file_lifecycle():
+    form = _parse_direct(COLLECT_EXAMPLE).collect()
+    stored = form.getfile('x')
+    assert stored.secure_filename == 'a.txt'
+    with stored:
+        assert stored.read(4) == b'file'
+    form.close()
+
+    with pytest.raises(ValueError):
+        stored.data
+    with pytest.raises(ValueError):
+        stored.read()
+    form.close()  # idempotent
+
+    # Handle already closed and removed: close tolerates FileNotFoundError.
+    other = _parse_direct(COLLECT_EXAMPLE).collect()
+    target = other.getfile('docs')
+    target._file.close()
+    os.unlink(target.path)
+    target.close()
+
+    # Context-manager form.
+    with _parse_direct(COLLECT_EXAMPLE).collect() as context_form:
+        assert context_form.getfilelist('docs')
+
+
+def test_collected_form_accessors():
+    collected = CollectedForm()
+    assert collected.get('missing') is None
+    assert collected.get('missing', 'default') == 'default'
+    assert collected.getlist('missing') == []
+    assert collected.getfile('missing') is None
+    assert collected.getfilelist('missing') == []
+
+
+def test_prologue_is_skipped():
+    body = b'this is the prologue\r\n' + COLLECT_EXAMPLE
+    form = _parse_direct(body)
+
+    with form.collect() as collected:
+        assert collected.fields == {'x': ['one', 'two']}
+        assert len(collected.getfilelist('docs')) == 2
+
+
+async def test_collect_sync_async_parity():
+    queue = asyncio.Queue()
+
+    class FakeStream:
+        async def __aiter__(self):
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    return
+                yield chunk
+
+    async def feed(body):
+        for index in range(0, len(body), 11):
+            await queue.put(body[index : index + 11])
+        await queue.put(None)
+
+    def summarize(form):
+        return {
+            'fields': form.fields,
+            'files': [
+                (stored.filename, stored.data)
+                for files in form.files.values()
+                for stored in files
+            ],
+        }
+
+    for body in (COLLECT_EXAMPLE, CORRUPTED_BOUNDARY_EXAMPLE):
+        sync_form = _parse_direct(body)
+        try:
+            with sync_form.collect() as collected:
+                sync_result = summarize(collected)
+                sync_error = None
+        except MultipartParseError as ex:
+            sync_result = None
+            sync_error = (ex.status, ex.description)
+
+        reader = AsyncBufferedReader(FakeStream())
+        handler = media.MultipartFormHandler()
+        async_form = await handler.deserialize_async(
+            reader, 'multipart/form-data; boundary=B', None
+        )
+        feed_task = asyncio.ensure_future(feed(body))
+        try:
+            async with await async_form.collect() as collected:
+                async_result = summarize(collected)
+                async_error = None
+        except MultipartParseError as ex:
+            async_result = None
+            async_error = (ex.status, ex.description)
+        await feed_task
+
+        assert sync_result == async_result
+        assert sync_error == async_error

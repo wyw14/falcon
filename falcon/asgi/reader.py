@@ -113,7 +113,10 @@ class BufferedReader:
             yield chunk
 
     async def _iter_delimited(
-        self, delimiter: bytes, size_hint: int = 0
+        self,
+        delimiter: bytes,
+        size_hint: int = 0,
+        require_delimiter: bool = False,
     ) -> AsyncIterator[bytes]:
         delimiter_len_1 = len(delimiter) - 1
         if not 0 <= delimiter_len_1 < self._chunk_size:
@@ -173,6 +176,8 @@ class BufferedReader:
                     yield self._buffer[:pos]
                 return
 
+        if require_delimiter:
+            raise DelimiterError('delimiter not found before end of stream')
         yield self._buffer
 
     async def _consume_delimiter(self, delimiter: bytes) -> None:
@@ -245,8 +250,15 @@ class BufferedReader:
 
         return result_bytes.getvalue()
 
-    def delimit(self, delimiter: bytes) -> BufferedReader:  # TODO: should se self
-        return type(self)(self._iter_delimited(delimiter), chunk_size=self._chunk_size)
+    def delimit(
+        self, delimiter: bytes, require_delimiter: bool = False
+    ) -> BufferedReader:  # TODO: should se self
+        return type(self)(
+            self._iter_delimited(
+                delimiter, require_delimiter=require_delimiter
+            ),
+            chunk_size=self._chunk_size,
+        )
 
     # -------------------------------------------------------------------------
     # Asynchronous IO interface.

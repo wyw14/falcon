@@ -69,6 +69,68 @@ default, allowing you to use ``req.get_media()`` to iterate over the
    <multipart_cloud_upload>`. Falcon offers straightforward support for all
    of these scenarios.
 
+Collecting Fields and Files
+---------------------------
+
+When a form may contain multiple parts sharing the same field name (e.g.
+several checkboxes or several uploaded files), the form may alternatively be
+eagerly collected via :meth:`~falcon.media.multipart.MultipartForm.collect`.
+This method reads every part, and returns a :class:`CollectedForm` that keeps
+normal text fields and uploaded files separate, with all values retained in
+the order they appeared in the request (nothing is overwritten):
+
+.. tab-set::
+
+    .. tab-item:: WSGI
+        :sync: wsgi
+
+        .. code:: python
+
+            with req.media.collect() as form:
+                # All values of the same-named field, in request order.
+                colors = form.getlist('colors')
+                # Uploaded files are spooled into temporary files.
+                upload = form.getfile('upload')
+                if upload is not None:
+                    data = upload.data
+
+    .. tab-item:: ASGI
+        :sync: asgi
+
+        .. code:: python
+
+        # ``form`` is the object returned by ``await req.get_media()``.
+        async with await form.collect() as collected:
+            colors = collected.getlist('colors')
+            upload = collected.getfile('upload')
+            if upload is not None:
+                data = upload.data
+
+The returned :class:`CollectedForm` owns the spooled files. It should be
+closed, or used as a context manager, to release them. If the form is
+malformed or parsing fails midway, all files already spooled are released
+before the :class:`~falcon.media.multipart.MultipartParseError` is
+propagated, and subsequent attempts to collect the form raise the same
+error.
+
+.. tab-set::
+
+    .. tab-item:: WSGI
+        :sync: wsgi
+
+        .. autoclass:: falcon.media.multipart.CollectedForm
+            :members:
+
+        .. autoclass:: falcon.media.multipart.StoredFile
+            :members:
+
+    .. tab-item:: ASGI
+        :sync: asgi
+
+        The ASGI variant uses the very same
+        :class:`~falcon.media.multipart.CollectedForm` and
+        :class:`~falcon.media.multipart.StoredFile` classes.
+
 Multipart Form and Body Part Types
 ----------------------------------
 

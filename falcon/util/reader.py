@@ -159,7 +159,12 @@ class BufferedReader:
         return result + self._buffer[:read_size]
 
     def read_until(
-        self, delimiter: bytes, size: int = -1, consume_delimiter: bool = False
+        self,
+        delimiter: bytes,
+        size: int = -1,
+        consume_delimiter: bool = False,
+        *,
+        require_delimiter: bool = False,
     ) -> bytes:
         # PERF(vytas): In Cython, bind types:
         #   cdef Py_ssize_t read_size
@@ -167,13 +172,18 @@ class BufferedReader:
 
         read_size = self._normalize_size(size)
         if read_size <= self._max_join_size:
-            return self._read_until(delimiter, read_size, consume_delimiter)
+            return self._read_until(
+                delimiter, read_size, consume_delimiter, require_delimiter
+            )
 
         # NOTE(vytas): A large size was requested, optimize for memory
         #   consumption by avoiding to momentarily keep both the chunks and the
         #   joint result in memory at the same time.
         result = io.BytesIO()
         self.pipe_until(delimiter, result, consume_delimiter, read_size)
+        if require_delimiter and not consume_delimiter:
+            if self.peek(len(delimiter)) != delimiter:
+                raise DelimiterError('delimiter not found before end of stream')
         return result.getvalue()
 
     def _finalize_read_until(
@@ -186,9 +196,13 @@ class BufferedReader:
         delimiter_pos: int = -1,
         next_chunk: bytes | None = None,
         next_chunk_len: int = 0,
+        require_delimiter: bool = False,
     ) -> bytes:
         if delimiter_pos < 0 and delimiter is not None:
             delimiter_pos = self._buffer.find(delimiter, self._buffer_pos)
+
+        if require_delimiter and delimiter_pos < 0:
+            raise DelimiterError('delimiter not found before end of stream')
 
         if delimiter_pos >= 0:
             size = min(size, have_bytes + delimiter_pos - self._buffer_pos)
@@ -225,7 +239,11 @@ class BufferedReader:
         return ret_value
 
     def _read_until(
-        self, delimiter: bytes, size: int, consume_delimiter: bool
+        self,
+        delimiter: bytes,
+        size: int,
+        consume_delimiter: bool,
+        require_delimiter: bool = False,
     ) -> bytes:
         # PERF(vytas): In Cython, bind types:
         #   cdef list result = []
@@ -281,7 +299,12 @@ class BufferedReader:
                 self._buffer_len += next_chunk_len
                 self._buffer += next_chunk
                 return self._finalize_read_until(
-                    size, result, have_bytes, consume_bytes, delimiter
+                    size,
+                    result,
+                    have_bytes,
+                    consume_bytes,
+                    delimiter,
+                    require_delimiter=require_delimiter,
                 )
 
             # NOTE(vytas): The buffer was empty before, skip straight to the
@@ -373,8 +396,12 @@ class BufferedReader:
     def exhaust(self) -> None:
         self.pipe()
 
-    def delimit(self, delimiter: bytes) -> BufferedReader:
-        read = functools.partial(self.read_until, delimiter)
+    def delimit(
+        self, delimiter: bytes, require_delimiter: bool = False
+    ) -> BufferedReader:
+        read = functools.partial(
+            self.read_until, delimiter, require_delimiter=require_delimiter
+        )
         return type(self)(read, self._normalize_size(None), self._chunk_size)
 
     def readline(self, size: int = -1) -> bytes:
