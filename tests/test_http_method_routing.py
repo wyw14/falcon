@@ -283,7 +283,7 @@ class TestHttpMethodRouting:
     ):
         client.app.add_route('/get_with_param/{param}', resource_get_with_faulty_put)
         for method in HTTP_METHODS + WEBDAV_METHODS:
-            if method in ('GET', 'PUT', 'OPTIONS'):
+            if method in ('GET', 'HEAD', 'PUT', 'OPTIONS'):
                 continue
 
             resource_get_with_faulty_put.called = False
@@ -296,7 +296,103 @@ class TestHttpMethodRouting:
             assert response.status == falcon.HTTP_405
 
             headers = response.headers
-            assert headers['allow'] == 'GET, PUT, OPTIONS'
+            assert headers['allow'] == 'GET, HEAD, PUT, OPTIONS'
+
+    def test_head_defaults_to_get_with_path_params(self, client):
+        class HeadWithParamsResource:
+            def __init__(self):
+                self.calls = []
+
+            def on_get(self, req, resp, param):
+                self.calls.append(req.method)
+                resp.status = falcon.HTTP_204
+
+        resource = HeadWithParamsResource()
+        client.app.add_route('/get_with_param/{param}', resource)
+        response = client.simulate_request(
+            method='HEAD', path='/get_with_param/bogus_param'
+        )
+
+        assert response.status == falcon.HTTP_204
+        assert not response.content
+        assert resource.calls == ['HEAD']
+
+    def test_head_uses_get_headers_without_body(self, client):
+        class HeadViaGetResource:
+            def __init__(self):
+                self.get_calls = 0
+
+            def on_get(self, req, resp):
+                self.get_calls += 1
+                resp.text = 'Hello, HEAD!'
+                resp.set_header('cache-control', 'max-age=60')
+                resp.set_header('x-custom', 'ping')
+
+        resource = HeadViaGetResource()
+        client.app.add_route('/head', resource)
+
+        response = client.simulate_head('/head')
+
+        assert response.status_code == 200
+        assert not response.content
+        assert response.headers['cache-control'] == 'max-age=60'
+        assert response.headers['x-custom'] == 'ping'
+        assert response.headers['content-length'] == str(len(b'Hello, HEAD!'))
+        # NOTE: The GET responder's side effects must run just once.
+        assert resource.get_calls == 1
+
+        # NOTE: An ordinary GET keeps serving the full body.
+        response = client.simulate_get('/head')
+        assert response.status == falcon.HTTP_200
+        assert response.text == 'Hello, HEAD!'
+        assert response.headers['cache-control'] == 'max-age=60'
+
+    def test_head_explicit_responder_not_replaced(self, client, resource_misc):
+        client.app.add_route('/misc', resource_misc)
+
+        resource_misc.called = False
+        client.simulate_request(path='/misc', method='HEAD')
+        assert resource_misc.called
+        assert resource_misc.req.method == 'HEAD'
+
+    def test_options_advertises_head_for_get_resource(self, client):
+        class GetResource:
+            def on_get(self, req, resp):
+                resp.text = 'get'
+
+        client.app.add_route('/get', GetResource())
+        response = client.simulate_options('/get')
+
+        assert response.status == falcon.HTTP_200
+        assert response.headers['allow'] == 'GET, HEAD'
+
+    def test_method_not_allowed_vs_not_found(self, client):
+        class GetResource:
+            def on_get(self, req, resp):
+                resp.text = 'get'
+
+        client.app.add_route('/exists', GetResource())
+
+        response = client.simulate_post('/exists')
+        assert response.status == falcon.HTTP_405
+        assert response.headers['allow'] == 'GET, HEAD, OPTIONS'
+
+        response = client.simulate_get('/does-not-exist')
+        assert response.status == falcon.HTTP_404
+
+    @pytest.mark.filterwarnings('ignore:Unknown REQUEST_METHOD')
+    def test_unknown_method_allow_lists_registered_methods(self, client):
+        class GetResource:
+            def on_get(self, req, resp):
+                resp.text = 'get'
+
+        client.app.add_route('/get-only', GetResource())
+
+        response = client.simulate_request(path='/get-only', method='SETECASTRONOMY')
+        assert response.status == falcon.HTTP_405
+        # NOTE: The Allow header must not list every method known to Falcon,
+        #   only the ones registered for (or implied by) the resource.
+        assert response.headers['allow'] == 'GET, HEAD, OPTIONS'
 
     def test_default_on_options(self, client, resource_things):
         client.app.add_route('/things', resource_things)

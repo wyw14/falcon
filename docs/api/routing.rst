@@ -116,6 +116,14 @@ will be rendered by default as a 405 response for a regular HTTP request, and a
 Falcon also provides a default responder for OPTIONS requests that takes into
 account which methods are implemented for the target resource.
 
+Unless a resource defines its own ``on_head()`` responder, implementing
+``on_get()`` also enables ``HEAD`` for the route. In that case, a ``HEAD``
+request is handled by the resource's ``GET`` responder (exactly once, so that
+its side effects are not repeated), and the framework returns the same
+headers that a ``GET`` would while omitting the response body. The methods
+advertised by the default OPTIONS responder and by 405 responses include
+``HEAD`` whenever ``GET`` is supported.
+
 Default Behavior
 ----------------
 

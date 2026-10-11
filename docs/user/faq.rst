@@ -1034,7 +1034,10 @@ I'm setting a response body, but it isn't getting returned. What's going on?
 ----------------------------------------------------------------------------
 Falcon skips processing the response body when, according to the HTTP
 spec, no body should be returned. If the client
-sends a HEAD request, the framework will always return an empty body.
+sends a HEAD request, the framework will always return an empty body. When the
+resource does not define its own ``on_head()`` responder, Falcon invokes its
+``on_get()`` responder exactly once to produce the response headers (such as
+``Content-Length``), and then omits the body.
 Falcon will also return an empty body whenever the response status is any
 of the following::
 

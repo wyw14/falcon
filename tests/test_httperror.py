@@ -432,7 +432,7 @@ class TestHTTPError:
             ('GET', '/404', 404),
             ('GET', '/notfound', 404),
             ('REPORT', '/404', 405),
-            ('BREW', '/notfound', 400),
+            ('BREW', '/notfound', 405),
         ],
     )
     def test_custom_error_serializer_optional_representation(

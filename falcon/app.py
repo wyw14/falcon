@@ -1118,8 +1118,11 @@ class App(Generic[_ReqT, _RespT]):
         Note:
             If a responder was matched to the given URI, but the HTTP
             method was not found in the method_map for the responder,
-            the responder callable element of the returned tuple will be
-            `falcon.responder.bad_request`.
+            a responder for
+            :class:`~.HTTPMethodNotAllowed` (i.e. ``405``) is generated
+            from the methods supported by the matched resource. Meta methods
+            (such as ``WEBSOCKET``) keep using the bad-request default
+            responder.
 
             Likewise, if no responder was matched for the given URI, then
             the responder callable element of the returned tuple will be
@@ -1158,13 +1161,71 @@ class App(Generic[_ReqT, _RespT]):
             try:
                 responder = method_map[method]
             except KeyError:
-                # NOTE(kgriffs): Dirty hack! We use __class__ here to avoid
-                #   binding self to the default responder method. We could
-                #   decorate the function itself with @staticmethod, but it
-                #   would perhaps be less obvious to the reader why this is
-                #   needed when just looking at the code in the responder
-                #   module, so we just grab it directly here.
-                responder = self.__class__._default_responder_bad_request
+                cls = self.__class__
+
+                if method in constants._META_METHODS:
+                    # NOTE(kgriffs): Dirty hack! We use __class__ here to
+                    #   avoid binding self to the default responder method.
+                    #   We could decorate the function itself with
+                    #   @staticmethod, but it would perhaps be less obvious
+                    #   to the reader why this is needed when just looking
+                    #   at the code in the responder module, so we just grab
+                    #   it directly here.
+                    responder = cls._default_responder_bad_request
+                else:
+                    # NOTE: The route itself was matched, therefore this is
+                    #   not a 404 Not Found. Advertise the methods registered
+                    #   for the resource (HEAD is implied by GET per
+                    #   RFC 9110).
+                    allowed_methods = [
+                        m
+                        for m in sorted(method_map)
+                        if m not in constants._META_METHODS
+                    ]
+                    if 'GET' in allowed_methods and 'HEAD' not in allowed_methods:
+                        allowed_methods.insert(allowed_methods.index('GET') + 1, 'HEAD')
+
+                    if method == 'HEAD' and 'GET' in method_map:
+                        # NOTE: The router (e.g. a custom one) did not map
+                        #   HEAD, but the resource does support GET, so serve
+                        #   HEAD with the same headers (the app strips the
+                        #   body).
+                        responder = responders.create_default_head(
+                            method_map['GET'], asgi=self._ASGI
+                        )
+                    elif method == 'OPTIONS':
+                        responder = responders.create_default_options(
+                            allowed_methods, asgi=self._ASGI
+                        )
+                    else:
+                        # NOTE: Prefer the router's prebuilt 405 responder,
+                        #   which advertises exactly the methods the resource
+                        #   supports (the default method map is otherwise
+                        #   populated with 405 responders for every known
+                        #   HTTP method).
+                        method_not_allowed = next(
+                            (
+                                candidate
+                                for candidate in method_map.values()
+                                if getattr(
+                                    candidate,
+                                    responders._ALLOWED_METHODS_ATTR,
+                                    None,
+                                )
+                                is not None
+                            ),
+                            None,
+                        )
+
+                        if method_not_allowed is not None:
+                            responder = method_not_allowed
+                        else:
+                            if 'OPTIONS' not in allowed_methods:
+                                allowed_methods.append('OPTIONS')
+
+                            responder = responders.create_method_not_allowed(
+                                allowed_methods, asgi=self._ASGI
+                            )
         else:
             params = {}
 

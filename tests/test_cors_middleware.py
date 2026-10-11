@@ -79,7 +79,7 @@ class TestCorsMiddleware:
                 ('Access-Control-Request-Headers', 'X-PINGOTHER, Content-Type'),
             )
         )
-        assert result.headers['Access-Control-Allow-Methods'] == 'DELETE, GET'
+        assert result.headers['Access-Control-Allow-Methods'] == 'DELETE, GET, HEAD'
         assert (
             result.headers['Access-Control-Allow-Headers']
             == 'X-PINGOTHER, Content-Type'
@@ -111,7 +111,7 @@ class TestCorsMiddleware:
                 ('Access-Control-Request-Method', 'POST'),
             )
         )
-        assert result.headers['Access-Control-Allow-Methods'] == 'DELETE, GET'
+        assert result.headers['Access-Control-Allow-Methods'] == 'DELETE, GET, HEAD'
         assert result.headers['Access-Control-Allow-Headers'] == '*'
         assert (
             result.headers['Access-Control-Max-Age'] == '86400'

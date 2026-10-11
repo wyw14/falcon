@@ -348,13 +348,17 @@ value of the Allow header:
 
 .. code:: bash
 
-    allow: GET, OPTIONS
+    allow: GET, HEAD, OPTIONS
 
 This is generated automatically by Falcon based on the set of
 methods implemented by the target resource. If a resource does not
 include its own OPTIONS responder, the framework provides a
 default implementation. Therefore, OPTIONS is always included in the
-list of allowable methods.
+list of allowable methods. Likewise, a resource that implements ``GET``
+automatically supports ``HEAD``: the framework invokes the resource's
+``GET`` responder and returns the same response headers, but omits the
+body. A resource may still provide its own ``HEAD`` responder if it
+needs to customize this behavior.
 
 .. note::
 

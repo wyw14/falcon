@@ -40,10 +40,12 @@ class TestWSGIServer:
         assert resp.status_code == 200
         assert resp.text == '{}'
 
-    def test_head_405(self, requests_lite, server_base_url):
+    def test_head(self, requests_lite, server_base_url):
         body = '{}'
         resp = requests_lite.head(server_base_url, data=body)
-        assert resp.status_code == 405
+        assert resp.status_code == 200
+        # NOTE: HEAD is served via on_get, but the body must be omitted.
+        assert not resp.content
 
     def test_post(self, requests_lite, server_base_url):
         body = testing.rand_string(_SIZE_1_KB // 2, _SIZE_1_KB)

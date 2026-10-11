@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from collections.abc import Iterable
 from typing import Any, NoReturn, TYPE_CHECKING
 
@@ -31,6 +32,12 @@ if TYPE_CHECKING:
     from falcon import Response
     from falcon.asgi import Request as AsgiRequest
     from falcon.asgi import Response as AsgiResponse
+
+
+# Attribute used to tag the auto-generated responders that raise
+# HTTPMethodNotAllowed with the tuple of methods that the target resource
+# actually supports.
+_ALLOWED_METHODS_ATTR = '_falcon_allowed_methods'
 
 
 def path_not_found(req: Request, resp: Response, **kwargs: Any) -> NoReturn:
@@ -65,6 +72,8 @@ def create_method_not_allowed(
             (default ``False``).
     """
 
+    allowed_methods = tuple(allowed_methods)
+
     if asgi:
 
         async def method_not_allowed_responder_async(
@@ -72,12 +81,53 @@ def create_method_not_allowed(
         ) -> NoReturn:
             raise HTTPMethodNotAllowed(allowed_methods)
 
+        setattr(
+            method_not_allowed_responder_async,
+            _ALLOWED_METHODS_ATTR,
+            allowed_methods,
+        )
         return method_not_allowed_responder_async
 
     def method_not_allowed(req: Request, resp: Response, **kwargs: Any) -> NoReturn:
         raise HTTPMethodNotAllowed(allowed_methods)
 
+    setattr(method_not_allowed, _ALLOWED_METHODS_ATTR, allowed_methods)
     return method_not_allowed
+
+
+def create_default_head(
+    get_responder: Callable[..., Any], asgi: bool = False
+) -> ResponderCallable | AsgiResponderCallable:
+    """Create a default responder for ``HEAD`` requests.
+
+    The default ``HEAD`` responder delegates to the resource's ``GET``
+    responder, so that the response exposes exactly the same headers that a
+    ``GET`` would. Per RFC 9110, the framework omits the response body when
+    the request method is ``HEAD``.
+
+    The ``GET`` responder is only invoked once per request; in particular, the
+    responder's side effects are not repeated in order to produce the
+    response.
+
+    Args:
+        get_responder: The resource's ``GET`` responder to delegate to.
+        asgi (bool): ``True`` if using an ASGI app, ``False`` otherwise
+            (default ``False``).
+    """
+
+    if asgi:
+
+        async def head_responder_async(
+            req: AsgiRequest, resp: AsgiResponse, **kwargs: Any
+        ) -> None:
+            await get_responder(req, resp, **kwargs)  # type: ignore[misc]
+
+        return head_responder_async
+
+    def head_responder(req: Request, resp: Response, **kwargs: Any) -> None:
+        get_responder(req, resp, **kwargs)
+
+    return head_responder
 
 
 def create_default_options(

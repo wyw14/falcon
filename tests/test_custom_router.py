@@ -142,3 +142,116 @@ def test_custom_router_takes_req_keyword_argument(asgi, util):
     client = testing.TestClient(app)
     response = client.simulate_request(path='/test')
     assert response.content == b'OK'
+
+
+def test_custom_router_sparse_method_map(asgi, util):
+    if asgi:
+
+        async def responder(req, resp):
+            resp.text = 'OK'
+
+    else:
+
+        def responder(req, resp):  # type: ignore[misc]
+            resp.text = 'OK'
+
+    class CustomRouter:
+        def find(self, uri, req=None):
+            if uri == '/test':
+                # NOTE: Intentionally sparse map, without default responders.
+                return responder, {'GET': responder}, {}, None
+
+            return None
+
+    client = testing.TestClient(util.create_app(asgi=asgi, router=CustomRouter()))
+
+    # NOTE: A matched route with an unsupported method is 405 (not 404/400).
+    response = client.simulate_post('/test')
+    assert response.status == falcon.HTTP_405
+    assert response.headers['allow'] == 'GET, HEAD, OPTIONS'
+
+    # NOTE: HEAD is synthesized from GET without a body.
+    response = client.simulate_head('/test')
+    assert response.status == falcon.HTTP_200
+    assert not response.content
+    assert response.headers['content-length'] == '2'
+
+    # NOTE: A default OPTIONS responder is synthesized as well.
+    response = client.simulate_options('/test')
+    assert response.status == falcon.HTTP_200
+    assert response.headers['allow'] == 'GET, HEAD'
+
+    # NOTE: An unmatched route is still 404.
+    response = client.simulate_get('/missing')
+    assert response.status == falcon.HTTP_404
+
+
+def test_custom_router_sparse_method_map_with_options(asgi, util):
+    if asgi:
+
+        async def responder(req, resp, **kwargs):
+            resp.text = 'OK'
+
+        async def options_responder(req, resp, **kwargs):
+            resp.set_header('Allow', 'GET, OPTIONS')
+
+    else:
+
+        def responder(req, resp, **kwargs):  # type: ignore[misc]
+            resp.text = 'OK'
+
+        def options_responder(req, resp, **kwargs):  # type: ignore[misc]
+            resp.set_header('Allow', 'GET, OPTIONS')
+
+    class CustomRouter:
+        def find(self, uri, req=None):
+            if uri == '/test':
+                # NOTE: Sparse map, with an explicit OPTIONS responder.
+                return (
+                    object(),
+                    {'GET': responder, 'OPTIONS': options_responder},
+                    {},
+                    None,
+                )
+
+            return None
+
+    client = testing.TestClient(util.create_app(asgi=asgi, router=CustomRouter()))
+
+    response = client.simulate_post('/test')
+    assert response.status == falcon.HTTP_405
+    # NOTE: OPTIONS must not be duplicated when the map already lists it.
+    assert response.headers['allow'] == 'GET, HEAD, OPTIONS'
+
+    response = client.simulate_options('/test')
+    assert response.status == falcon.HTTP_200
+    assert response.headers['allow'] == 'GET, OPTIONS'
+
+
+def test_custom_router_sparse_method_map_meta(asgi, util):
+    def get_responder(req, resp, **kwargs):
+        resp.text = 'OK'
+
+    class CustomRouter:
+        def find(self, uri, req=None):
+            if uri == '/ws':
+                # NOTE: Sparse map without a WEBSOCKET responder.
+                return object(), {'GET': get_responder}, {}, '/ws'
+
+            return None
+
+    app = util.create_app(asgi=asgi, router=CustomRouter())
+    req = util.create_req(asgi, path='/ws', method='GET')
+    req.is_websocket = True
+
+    default_responder, _, _, _ = app._get_responder(req)
+
+    # NOTE: Meta methods keep the bad-request default responder.
+    assert default_responder is type(app)._default_responder_bad_request
+
+    resp = util.create_resp(asgi)
+    with pytest.raises(falcon.HTTPBadRequest):
+        if asgi:
+            falcon.async_to_sync(default_responder, req, resp)
+        else:
+            default_responder(req, resp)

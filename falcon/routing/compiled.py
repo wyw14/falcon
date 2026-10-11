@@ -219,18 +219,21 @@ class CompiledRouter:
 
             default_responder = getattr(resource, responder_name, None)
 
-        # NOTE(gespyrop): We do not verify whether the default responder is
-        # a regular synchronous method or a coroutine since it falls under the
-        # general case that will be handled by _require_coroutine_responders()
-        # and _require_non_coroutine_responders().
-        set_default_responders(
-            method_map, asgi=asgi, default_responder=default_responder
-        )
+        if default_responder is not None:
+            default_responder = self._validate_responder(default_responder, asgi)
 
         if asgi:
             self._require_coroutine_responders(method_map)
         else:
             self._require_non_coroutine_responders(method_map)
+
+        # NOTE: Default responders are installed after the explicitly mapped
+        #   responders have been validated (and possibly wrapped for ASGI), so
+        #   that a synthesized HEAD responder delegates to the very same GET
+        #   responder object that will be invoked.
+        set_default_responders(
+            method_map, asgi=asgi, default_responder=default_responder
+        )
 
         # NOTE(kgriffs): Fields may have whitespace in them, so sub
         # those before checking the rest of the URI template.
@@ -360,40 +363,54 @@ class CompiledRouter:
     # Private
     # -----------------------------------------------------------------
 
-    def _require_coroutine_responders(self, method_map: MethodDict) -> None:
-        for method, responder in method_map.items():
-            # NOTE(kgriffs): We don't simply wrap non-async functions
-            #   since they likely perform relatively long blocking
-            #   operations that need to be explicitly made non-blocking
-            #   by the developer; raising an error helps highlight this
-            #   issue.
+    def _validate_responder(
+        self, responder: Callable[..., Any], asgi: bool
+    ) -> Callable[..., Any]:
+        """Validate a user responder, wrapping sync functions for ASGI.
+
+        Args:
+            responder: The user-provided responder to validate.
+            asgi (bool): ``True`` if routing for an ASGI app, ``False``
+                for WSGI.
+
+        Returns:
+            The responder as-is, or an async wrapper when sync responders are
+            configured to be wrapped for ASGI.
+        """
+        # NOTE(kgriffs): We don't simply wrap non-async functions
+        #   since they likely perform relatively long blocking
+        #   operations that need to be explicitly made non-blocking
+        #   by the developer; raising an error helps highlight this
+        #   issue.
+        if asgi:
             if not iscoroutinefunction(responder) and is_python_func(responder):
                 if _should_wrap_non_coroutines():
-                    method_map[method] = wrap_sync_to_async(responder)
-                else:
-                    msg = (
-                        'The {} responder must be a non-blocking '
-                        'async coroutine (i.e., defined using async def) to '
-                        'avoid blocking the main request thread.'
-                    )
-                    msg = msg.format(responder)
-                    raise TypeError(msg)
+                    return wrap_sync_to_async(responder)
+
+                msg = (
+                    'The {} responder must be a non-blocking '
+                    'async coroutine (i.e., defined using async def) to '
+                    'avoid blocking the main request thread.'
+                )
+                raise TypeError(msg.format(responder))
+        elif iscoroutinefunction(responder):
+            msg = (
+                'The {} responder must be a regular synchronous '
+                'method to be used with a WSGI app.'
+            )
+            raise TypeError(msg.format(responder))
+
+        return responder
+
+    def _require_coroutine_responders(self, method_map: MethodDict) -> None:
+        for method, responder in method_map.items():
+            wrapped = self._validate_responder(responder, asgi=True)
+            if wrapped is not responder:
+                method_map[method] = wrapped
 
     def _require_non_coroutine_responders(self, method_map: MethodDict) -> None:
-        for method, responder in method_map.items():
-            # NOTE(kgriffs): We don't simply wrap non-async functions
-            #   since they likely perform relatively long blocking
-            #   operations that need to be explicitly made non-blocking
-            #   by the developer; raising an error helps highlight this
-            #   issue.
-
-            if iscoroutinefunction(responder):
-                msg = (
-                    'The {} responder must be a regular synchronous '
-                    'method to be used with a WSGI app.'
-                )
-                msg = msg.format(responder)
-                raise TypeError(msg)
+        for responder in method_map.values():
+            self._validate_responder(responder, asgi=False)
 
     def _validate_template_segment(self, segment: str, used_names: set[str]) -> None:
         """Validate a single path segment of a URI template.

@@ -388,7 +388,10 @@ name that starts with ``on_`` and ends in the lowercased HTTP method name (e.g.,
   If a Python method is omitted for a given HTTP verb, the framework will
   automatically respond with ``405 Method Not Allowed``. Falcon also provides
   a default responder for OPTIONS requests that takes into account which
-  methods are implemented for the target resource.
+  methods are implemented for the target resource. A resource that implements
+  ``GET`` also supports ``HEAD`` automatically; the resource's ``GET``
+  responder is used to generate the response headers, while the body is
+  omitted.
 
 Here we opted to implement support for both a single image (which supports
 ``GET`` for downloading the image) and a collection of images (which supports

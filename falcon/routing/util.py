@@ -98,6 +98,11 @@ def set_default_responders(
 ) -> None:
     """Map HTTP methods not explicitly defined on a resource to default responders.
 
+    When a resource implements ``GET`` but not ``HEAD``, and no catch-all
+    *default_responder* (such as ``on_request``) is supplied, a default
+    ``HEAD`` responder is installed that delegates to the resource's ``GET``
+    responder (the response body is then omitted by the app).
+
     Args:
         method_map: A dict with HTTP methods mapped to responders explicitly
             defined in a resource.
@@ -109,6 +114,16 @@ def set_default_responders(
             :class:`"405 Method Not Allowed" <falcon.HTTPMethodNotAllowed>`
             is constructed.
     """
+
+    # NOTE: Per RFC 9110, a HEAD response is identical to GET except that the
+    #   server MUST NOT send a message body. When the resource does not define
+    #   its own HEAD responder (and no catch-all default responder such as
+    #   on_request is in use), reuse the GET responder exactly once (so that
+    #   its side effects are not duplicated); the app layer strips the body.
+    if default_responder is None and 'GET' in method_map and 'HEAD' not in method_map:
+        method_map['HEAD'] = responders.create_default_head(
+            method_map['GET'], asgi=asgi
+        )  # type: ignore[assignment]
 
     # Attach a resource for unsupported HTTP methods
     allowed_methods = [
